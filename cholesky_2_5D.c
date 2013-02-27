@@ -6,144 +6,84 @@
 #include <upc_coll_mpi.h>
 #include "cholesky.h"
 
+typedef shared[] double* mytype_ptr;
 
-/* Execution parameters */
-#define threads 256 
-#define threads_per_layer 64
-#define sqrt_threads_per_layer 8
-#define c 4
-#define big_block_num
-#define total_small_block_num
-
-/*	
- 	Derived quantities will be:
-	(*) block_size = n/total_small_block_num
- 	(*) panel_size = n/big_block_num
- 	(*) blocks_per_panel = total_small_block_num/big_block_num
- 	(*) blocks_per_thread_per_panel = blocks_per_panel/sqrt_threads_per_layer
- 
-	(*) THINK: Define panel size in terms of number of small blocks
- */
-
-/* TODO: Add timers */
-
-shared mytype_ptr A[big_block_num][big_block_num][c][sqrt_threads_per_layer][sqrt_threads_per_layer];
-
-shared mytype_ptr global_Schur_complement[big_block_num][big_block_num][c][sqrt_threads_per_layer][sqrt_threads_per_layer];
-shared mytype_ptr column_buffer[THREADS];
-shared mytype_ptr received_factorized_block[THREADS];
-shared mytype_ptr received_factorized_column[THREADS];
-shared mytype_ptr received_from_diagonal[THREADS];
-shared mytype_ptr reduction_buffer[THREADS];
+shared mytype_ptr distr_A[THREADS];
 
 int main(int argc, char **argv) {
 
-	const int sqrt_tpl = sqrt_threads_per_layer;
 	
-	int i, j, k, l, layer, big_index, small_index_row, small_index_column, move_ptr;
+	const int matrixDim = atoi(argv[1]);
+	const int blockDim = atoi(argv[2]);
+	const int c_rep = atoi(argv[3]);
+	const int big_blockDim = atoi(argv[4]);
 	
-	mytype_ptr local_A[big_block_num][big_block_num][c][sqrt_threads_per_layer][sqrt_threads_per_layer];
-	mytype_ptr Schur_complement[big_block_num][big_block_num][c][sqrt_threads_per_layer][sqrt_threads_per_layer];
+	const int num_blocks_dim = matrixDim/blockDim;
+	const int num_pes_dim = sqrt(THREADS/c_rep);
 	
-	upccoll_initialize(&argc, &argv);
-
+	const int my_num_blocks_dim = num_blocks_dim/num_pes_dim;
+	const int num_big_blocks_dim = matrixDim/big_blockDim;
+	const int num_small_in_big_blk = big_blockDim/blockDim;
+	const int my_num_small_in_big_blk = num_small_in_big_blk/num_pes_dim;
 	
-	/* Read input parameters */
-	/* The input matrix is n x n */
-	const int n = atoi(argv[1]);
-	/* The panel dim specifies the number of small blocks per "fat" panel */
-	const int panel_dim = atoi(argv[2]);
+	const int threads_per_layer = THREADS/c_rep;
 	
-    const int chunk_dim = n/(big_block_num*sqrt_tpl);
-    const int panel_dime = chunk_dim * panel_dim;
+	upccoll_team_t my_row_team, my_column_team, my_peers_team, my_layer_team;
+	int row_rank, column_rank, my_layer_rank, my_layer_id, my_row_rank, my_column_rank, my_peer_rank, layer_rank;
 	
-	/* Create local directory */  
     
-    for (i=0; i<big_block_num; i++)
-        for (j=0; j<big_block_num; j++)
-            for (k=0; k<sqrt_tpl; k++)
-                for (l=0; l<sqrt_tpl; l++)
-                    for (layer = 0; layer < c; layer++) {
-                        owner_directory[i][j][layer][k][l] = (int) upc_threadof(&A[i][j][layer][k][l]);
-                    }
+    /* Create teams per layer */
+    upccoll_team_split(UPC_TEAM_ALL, MYTHREAD/threads_per_layer, MYTHREAD%threads_per_layer, &my_layer_team);
+    upccoll_team_rank(my_layer_team, &my_layer_rank);
     
+    /* Create teams for intra-layer broadcasts */
+    upccoll_team_split(my_layer_team, my_layer_rank/num_pes_dim, my_layer_rank%num_pes_dim, &my_row_team);
+    upccoll_team_rank(my_row_team, &my_row_rank);
     
-    /* Memory allocation */
-    
-    for (big_index = 0; big_index < big_block_num; big_index++) {
-        for (small_index_row = 0; small_index_row < sqrt_tpl; small_index_row++) {
-            for (small_index_column = 0; small_index_column < sqrt_tpl; small_index_column++) {
-                for (layer = 0; layer < c; layer++) {
-                    /* Allocation of columns for elements on or below diagonal */
-                    if (small_index_column <= small_index_row) {
-                        if (MYTHREAD == owner_directory[big_index][big_index][layer][small_index_row][small_index_column]) {
-                            column_buffer[MYTHREAD] = (mytype_ptr) upc_alloc(chunk_dim * chunk_dim * (big_block_num-big_index) * sizeof(double));
-                            for (I=0; I<chunk_dim * chunk_dim * (big_block_num-big_index); I++)
-                                *(column_buffer[MYTHREAD]+I)=0;
-                            /* make appropriate pointer assignments */
-                            move_ptr = 0;
-                            for (column_part = big_block_num-1; column_part >= big_index; column_part--) {
-                                A[column_part][big_index][layer][small_index_row][small_index_column] = column_buffer[MYTHREAD]+move_ptr*(chunk_dim * chunk_dim);
-                                move_ptr++;
-                            }
-                        }
-                    }
-					
-                    /* Allocation of columns for elements above diagonal */
-                    if (small_index_column > small_index_row) {
-                        if (MYTHREAD == owner_directory[big_index][big_index][layer][small_index_row][small_index_column]) {
-                            column_buffer[MYTHREAD] = (mytype_ptr) upc_alloc(chunk_dim * chunk_dim * (big_block_num-big_index-1) * sizeof(double));
-                            for (I=0; I<chunk_dim * chunk_dim * (big_block_num-big_index-1); I++)
-                                *(column_buffer[MYTHREAD]+I)=0;
-                            /* make appropriate pointer assignments */
-                            move_ptr = 0;
-                            for (column_part = big_block_num-1; column_part > big_index; column_part--) {
-                                A[column_part][big_index][layer][small_index_row][small_index_column] = column_buffer[MYTHREAD]+move_ptr*(chunk_dim * chunk_dim);
-                                move_ptr++;
-                            }
-                        }
-                    }
-                    
-                    /* Allocation of Schur complement - meaningful for a part of the matrix */
-                    if (big_index > 0) {
-                        /* allocation of columns for elements on or below diagonal */
-                        if (small_index_column <= small_index_row) {
-                            if (MYTHREAD == owner_directory[big_index][big_index][layer][small_index_row][small_index_column]) {
-                                column_buffer[MYTHREAD] = (mytype_ptr) upc_alloc(chunk_dim * chunk_dim * (big_block_num-big_index) * sizeof(double));
-                                for (I=0; I<chunk_dim * chunk_dim * (big_block_num-big_index); I++)
-                                    *(column_buffer[MYTHREAD]+I)=0;
-                                /* make appropriate pointer assignments */
-                                move_ptr = 0;
-                                for (column_part = big_block_num-1; column_part >= big_index; column_part--) {
-                                    global_Schur_complement[column_part][big_index][layer][small_index_row][small_index_column] = column_buffer[MYTHREAD]+move_ptr*(chunk_dim * chunk_dim);
-                                    move_ptr++;
-                                }
-                            }
-                        }
-                        
-                        /* allocation of columns for elements above diagonal */
-                        if (small_index_column > small_index_row) {
-                            if (MYTHREAD == owner_directory[big_index][big_index][layer][small_index_row][small_index_column]) {
-                                column_buffer[MYTHREAD] = (mytype_ptr) upc_alloc(chunk_dim * chunk_dim * (big_block_num-big_index-1) * sizeof(double));
-                                for (I=0; I<chunk_dim * chunk_dim * (big_block_num-big_index-1); I++)
-                                    *(column_buffer[MYTHREAD]+I)=0;
-                                /* make appropriate pointer assignments */
-                                move_ptr = 0;
-                                for (column_part = big_block_num-1; column_part > big_index; column_part--) {
-                                    global_Schur_complement[column_part][big_index][layer][small_index_row][small_index_column] = column_buffer[MYTHREAD]+move_ptr*(chunk_dim * chunk_dim);
-                                    move_ptr++;
-                                }
-                            }
-                        }
-						
-                    }
-                }
-            }
-        }
-    }
-    
-    upc_barrier;
+    upccoll_team_split(my_layer_team, my_layer_rank%num_pes_dim, my_layer_rank/num_pes_dim, &my_column_team);
+    upccoll_team_rank(my_column_team, &my_column_rank);
 	
-	my_layer_id  = MYTHREAD / threads_per_layer;
-
+    
+    /* Create teams for inter-layer broadcasts (peers per layer) */
+    upccoll_team_split(UPC_TEAM_ALL, MYTHREAD%threads_per_layer, MYTHREAD/threads_per_layer, &my_peers_team);
+    upccoll_team_rank(my_peers_team, &my_peer_rank);
+	
+    int layer_rank = my_layer_rank;
+	double * priv_A;
+	
+	int i_big, width, blocks_to_sub, blocks_to_proceed ;
+		
+	/* Count how many elements each process should allocate, 2 cases: 
+	 (1) If a process is above diagonal, then it owns (my_num_blocks_dim * (my_num_blocks_dim-1))/2 blocks  
+	 (2) If a process is on/below diagonal then it owns (my_num_blocks_dim * (my_num_blocks_dim+1))/2 blocks  */
+	
+	received_factorized_block[MYTHREAD] = (mytype_ptr) upc_alloc(chunk_dim * chunk_dim * sizeof(double));
+	
+	int above_diag = (my_layer_rank/num_pes_dim) < (my_layer_rank%num_pes_dim);
+	if (above_diag) { // case (1)
+		distr_A[MYTHREAD] = (mytype_ptr) upc_alloc(((my_num_blocks_dim * (my_num_blocks_dim-1)) * blockDim * blockDim / 2)* sizeof(double));
+		priv_A = (double *) distr_A[MYTHREAD];
+	} else { // case(2)
+		distr_A[MYTHREAD] = (mytype_ptr) upc_alloc(((my_num_blocks_dim * (my_num_blocks_dim+1)) * blockDim * blockDim / 2)* sizeof(double));
+		priv_A = (double *) distr_A[MYTHREAD];
+	}
+	
+	/* Create symmetric positive definite (Lehmer) matrix and store lower half */
+	/* TODO */
+	
+	/* Replicate input matrix A */
+	/* TODO */
+	 
+	for (i_big=0; i_big < num_big_blocks_dim; i_big++) {
+		/* Offset private A by the nymber of big blocks we have already factorized */
+		width = i_big * my_num_small_in_big_blk - 1 + above_diag ;
+		blocks_to_sub = width * (1+width) / 2 ;
+		blocks_to_proceed = my_num_blocks_dim * i_big * my_num_small_in_big_blk - blocks_to_sub;
+		
+		
+		
+	}
+	 
+	 
+	
 }
